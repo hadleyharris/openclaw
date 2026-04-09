@@ -253,23 +253,76 @@ RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
 
 ENV NODE_ENV=production
 
+# ── RENDER/CONTAINER PLATFORM FIX ───────────────────────────────
+# The default upstream CMD binds to loopback (127.0.0.1:18789) which is
+# unreachable on container platforms like Render, Railway, and Fly.io
+# that require binding to 0.0.0.0 on their designated PORT.
+#
+# This entrypoint script:
+#   1. Ensures openclaw.json exists with gateway.mode and controlUi fallback
+#   2. Patches controlUi.dangerouslyAllowHostHeaderOriginFallback into any
+#      existing config (required for non-loopback bind modes)
+#   3. Starts the gateway with --bind lan (resolves to 0.0.0.0) on $PORT
+#
+# The script is inlined via BuildKit heredoc (syntax=docker/dockerfile:1.7)
+# so no separate entrypoint.sh file needs to exist in the repo.
+COPY --chmod=755 <<'ENTRYPOINT' /app/entrypoint.sh
+#!/bin/sh
+STATE_DIR="${OPENCLAW_STATE_DIR:-/data/.openclaw}"
+CONFIG="$STATE_DIR/openclaw.json"
+mkdir -p "$STATE_DIR"
+
+# Write default config if none exists on the persistent disk
+if [ ! -f "$CONFIG" ]; then
+  cat > "$CONFIG" <<'CFGEOF'
+{
+  "gateway": {
+    "mode": "local",
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  }
+}
+CFGEOF
+  chown node:node "$CONFIG" 2>/dev/null || true
+fi
+
+# Ensure controlUi fallback is always set, even if config already exists
+# but was written before this fix (or was clobbered by --allow-unconfigured)
+node -e "
+  const fs = require('fs');
+  const f = '$CONFIG';
+  try {
+    const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!j.gateway) j.gateway = {};
+    if (!j.gateway.mode) j.gateway.mode = 'local';
+    if (!j.gateway.controlUi) j.gateway.controlUi = {};
+    j.gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback = true;
+    fs.writeFileSync(f, JSON.stringify(j, null, 2));
+  } catch (e) {
+    fs.writeFileSync(f, JSON.stringify({
+      gateway: {
+        mode: 'local',
+        controlUi: { dangerouslyAllowHostHeaderOriginFallback: true }
+      }
+    }, null, 2));
+  }
+" 2>/dev/null || true
+
+PORT="${PORT:-10000}"
+exec node openclaw.mjs gateway --bind lan --port "$PORT"
+ENTRYPOINT
+
 # Security hardening: Run as non-root user
 # The node:24-bookworm image includes a 'node' user (uid 1000)
 # This reduces the attack surface by preventing container escape via root privileges
 USER node
 
-# Start gateway server with default config.
-# Binds to loopback (127.0.0.1) by default for security.
-#
-# IMPORTANT: With Docker bridge networking (-p 18789:18789), loopback bind
-# makes the gateway unreachable from the host. Either:
-#   - Use --network host, OR
-#   - Override --bind to "lan" (0.0.0.0) and set auth credentials
-#
 # Built-in probe endpoints for container health checks:
 #   - GET /healthz (liveness) and GET /readyz (readiness)
 #   - aliases: /health and /ready
 # For external access from host/ingress, override bind to "lan" and set auth.
 HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||10000)+'/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["/app/entrypoint.sh"]
